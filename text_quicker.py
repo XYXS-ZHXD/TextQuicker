@@ -494,6 +494,8 @@ class TextQuickerApp:
         self._hotkey_registered = False
         self._prev_hwnd = None
         self._geom_timer = None  # P0: 防抖计时器
+        self._last_toggle_time = 0  # 上次快捷键触发时间（用于健康检测）
+        self._hotkey_health_timer = None  # 热键健康检查定时器
 
         self.root = tk.Tk()
         self.root.title("TextQuicker 文字快捷输入")
@@ -517,6 +519,8 @@ class TextQuickerApp:
         self._refresh_list()
         self._register_hotkey()
         self._setup_tray()
+        # 启动热键健康检测：每 30 秒检查一次，发现失效自动重注册
+        self._start_hotkey_health_check()
         self.root.after(100, self._minimize_to_tray)
 
     def _on_configure(self, event):
@@ -729,18 +733,28 @@ class TextQuickerApp:
             self._handler = keyboard.add_hotkey(self.config['hotkey'], self._toggle, suppress=True)
             self._hotkey_registered = True
             self.status_var.set("快捷键: {}  ✓".format(self.config['hotkey'].upper()))
+            # 刷新健康检测的时间基准
+            self._last_toggle_time = time.time()
         except Exception as e:
             self.status_var.set("快捷键注册失败: {}".format(e))
             print(f"[TextQuicker] 注册快捷键失败: {e}")
 
     def _toggle(self):
-        self.root.after(0, self._do_toggle)
+        # 记录触发时间，供健康检测使用
+        self._last_toggle_time = time.time()
+        try:
+            self.root.after(0, self._do_toggle)
+        except tk.TclError as e:
+            print(f"[TextQuicker] toggle 失败（可能窗口已销毁）: {e}")
 
     def _do_toggle(self):
-        if self.root.state() == 'withdrawn' or not self.root.winfo_viewable():
-            self._show()
-        else:
-            self.root.withdraw()
+        try:
+            if self.root.state() == 'withdrawn' or not self.root.winfo_viewable():
+                self._show()
+            else:
+                self.root.withdraw()
+        except tk.TclError as e:
+            print(f"[TextQuicker] _do_toggle 异常: {e}")
 
     def _show(self):
         if HAS_WIN32:
@@ -756,6 +770,28 @@ class TextQuickerApp:
 
     def _minimize_to_tray(self):
         self.root.withdraw()
+
+    # ── 热键健康检测 ──────────────────────────
+    def _start_hotkey_health_check(self):
+        """启动热键健康检测，每 30 秒检查一次"""
+        self._hotkey_health_timer = self.root.after(30000, self._check_hotkey_health)
+
+    def _check_hotkey_health(self):
+        """检测热键是否仍正常工作，如果超时未触发则重注册"""
+        try:
+            now = time.time()
+            # 如果窗口当前是隐藏状态（应该在托盘待命），但超过 120 秒没有触发热键
+            # 说明钩子可能已失效，尝试重新注册
+            if (HAS_KEYBOARD and self._hotkey_registered
+                    and self.root.state() == 'withdrawn'
+                    and now - self._last_toggle_time > 120):
+                print(f"[TextQuicker] 检测到热键可能失效（{int(now - self._last_toggle_time)}秒未触发），尝试重新注册")
+                self._register_hotkey()
+        except Exception as e:
+            print(f"[TextQuicker] 热键健康检测异常: {e}")
+        finally:
+            # 继续下一轮检测
+            self._start_hotkey_health_check()
 
     # ── 设置 ───────────────────────────────────
     def _open_settings(self):
@@ -797,6 +833,13 @@ class TextQuickerApp:
 
     def _quit_app(self, icon=None, item=None):
         self._save_geometry()
+        # 停止热键健康检测
+        if self._hotkey_health_timer:
+            try:
+                self.root.after_cancel(self._hotkey_health_timer)
+            except Exception:
+                pass
+            self._hotkey_health_timer = None
         try:
             if self.tray:
                 self.tray.stop()
