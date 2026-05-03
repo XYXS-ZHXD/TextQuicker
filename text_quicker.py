@@ -519,7 +519,7 @@ class TextQuickerApp:
         self._refresh_list()
         self._register_hotkey()
         self._setup_tray()
-        # 启动热键健康检测：每 30 秒检查一次，发现失效自动重注册
+        # 启动热键健康检测：每 15 秒刷新一次钩子，防止被系统静默卸载
         self._start_hotkey_health_check()
         self.root.after(100, self._minimize_to_tray)
 
@@ -773,24 +773,19 @@ class TextQuickerApp:
 
     # ── 热键健康检测 ──────────────────────────
     def _start_hotkey_health_check(self):
-        """启动热键健康检测，每 30 秒检查一次"""
-        self._hotkey_health_timer = self.root.after(30000, self._check_hotkey_health)
+        """启动热键健康检测，每 15 秒刷新一次钩子"""
+        self._hotkey_health_timer = self.root.after(15000, self._check_hotkey_health)
 
     def _check_hotkey_health(self):
-        """检测热键是否仍正常工作，如果超时未触发则重注册"""
+        """检测窗口是否处于隐藏待命状态，如果是则刷新热键钩子"""
         try:
-            now = time.time()
-            # 如果窗口当前是隐藏状态（应该在托盘待命），但超过 120 秒没有触发热键
-            # 说明钩子可能已失效，尝试重新注册
             if (HAS_KEYBOARD and self._hotkey_registered
-                    and self.root.state() == 'withdrawn'
-                    and now - self._last_toggle_time > 120):
-                print(f"[TextQuicker] 检测到热键可能失效（{int(now - self._last_toggle_time)}秒未触发），尝试重新注册")
+                    and self.root.state() == 'withdrawn'):
+                print(f"[TextQuicker] 例行热键维护，刷新钩子")
                 self._register_hotkey()
         except Exception as e:
             print(f"[TextQuicker] 热键健康检测异常: {e}")
         finally:
-            # 继续下一轮检测
             self._start_hotkey_health_check()
 
     # ── 设置 ───────────────────────────────────
