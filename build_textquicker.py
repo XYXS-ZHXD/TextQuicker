@@ -19,17 +19,17 @@ def run(cmd, cwd=None, check=True):
 
 def main():
     print("=" * 60)
-    print("  TextQuicker 打包工具")
+    print("  TextQuicker Build Tool")
     print("=" * 60)
 
-    # 1. 安装依赖
-    print("\n[1/3] 安装依赖库...")
+    # 1. Install dependencies
+    print("\n[1/3] Installing dependencies...")
     deps = ["keyboard", "pyperclip", "pywin32", "pystray", "Pillow", "pyinstaller"]
     for dep in deps:
         run(f'"{sys.executable}" -m pip install {dep} -q')
 
-    # 2. 打包
-    print("\n[2/3] 开始打包...")
+    # 2. Build
+    print("\n[2/3] Building with PyInstaller...")
     src = os.path.join(SCRIPT_DIR, "text_quicker.py")
     out_dir = os.path.join(PROJECT_DIR, "dist_textquicker")
 
@@ -44,15 +44,15 @@ def main():
     )
     run(cmd)
 
-    # 3. 完成
+    # 3. Done
     exe = os.path.join(out_dir, "TextQuicker.exe")
     if os.path.exists(exe):
         size = os.path.getsize(exe) / 1024 / 1024
-        print(f"\n[3/3] 打包成功！")
-        print(f"  路径: {exe}")
-        print(f"  大小: {size:.1f} MB")
+        print(f"\n[3/3] Build successful!")
+        print(f"  Path: {exe}")
+        print(f"  Size: {size:.1f} MB")
     else:
-        print("\n未找到输出文件，请检查上方日志。")
+        print("\nOutput not found, check logs above.")
 
 if __name__ == "__main__":
     main()

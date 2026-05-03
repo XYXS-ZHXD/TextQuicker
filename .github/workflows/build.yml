@@ -19,10 +19,14 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           pip install keyboard pyperclip pywin32 pystray Pillow pyinstaller
 
       - name: Build EXE with PyInstaller
+        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
           python build_textquicker.py
 
