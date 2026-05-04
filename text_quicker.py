@@ -10,6 +10,35 @@ import sys
 import threading
 import time
 import ctypes
+from ctypes import wintypes
+
+# ── Windows API 热键常量 ────────────────────
+user32 = ctypes.windll.user32
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+MOD_NOREPEAT = 0x4000
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+
+# 键盘虚拟键码映射（keyboard 格式 → Windows VK）
+_VK_MAP = {
+    'space': 0x20, 'enter': 0x0D, 'return': 0x0D, 'tab': 0x09,
+    'esc': 0x1B, 'escape': 0x1B, 'backspace': 0x08, 'delete': 0x2E,
+    'home': 0x24, 'end': 0x23, 'insert': 0x2D,
+    'up': 0x26, 'down': 0x28, 'left': 0x25, 'right': 0x27,
+    'pageup': 0x21, 'pagedown': 0x22, 'pgup': 0x21, 'pgdn': 0x22,
+}
+for i in range(1, 25):
+    _VK_MAP[f'f{i}'] = 0x6F + i
+for i in range(10):
+    _VK_MAP[str(i)] = 0x30 + i
+
+# 修饰键名 → 位标志
+_MOD_FLAGS = {
+    'ctrl': MOD_CONTROL, 'alt': MOD_ALT, 'shift': MOD_SHIFT, 'win': MOD_WIN,
+}
 
 # ── 依赖检测 ────────────────────────────────
 try:
@@ -494,8 +523,9 @@ class TextQuickerApp:
         self._hotkey_registered = False
         self._prev_hwnd = None
         self._geom_timer = None  # P0: 防抖计时器
-        self._last_toggle_time = 0  # 上次快捷键触发时间（用于健康检测）
-        self._hotkey_health_timer = None  # 热键健康检查定时器
+        self._hotkey_active = False  # 热键后台线程标志
+        self._hotkey_thread = None  # 热键监听线程
+        self._hotkey_thread_id = None  # 热键线程 ID
 
         self.root = tk.Tk()
         self.root.title("TextQuicker 文字快捷输入")
@@ -519,8 +549,6 @@ class TextQuickerApp:
         self._refresh_list()
         self._register_hotkey()
         self._setup_tray()
-        # 启动热键健康检测：每 15 秒刷新一次钩子，防止被系统静默卸载
-        self._start_hotkey_health_check()
         self.root.after(100, self._minimize_to_tray)
 
     def _on_configure(self, event):
@@ -720,28 +748,67 @@ class TextQuickerApp:
         if self.config.get('auto_paste', True):
             threading.Thread(target=simulate_paste, daemon=True).start()
 
-    # ── 快捷键 ─────────────────────────────────
-    def _register_hotkey(self):
-        if not HAS_KEYBOARD:
+    # ── 快捷键（Windows RegisterHotKey API）───
+    def _parse_hotkey(self, hotkey_str):
+        """解析 'ctrl+alt+space' 格式为 (modifier_flags, virtual_key_code)"""
+        parts = hotkey_str.lower().split('+')
+        mods = 0
+        vk = 0
+        for p in parts:
+            flag = _MOD_FLAGS.get(p)
+            if flag:
+                mods |= flag
+            elif p in _VK_MAP:
+                vk = _VK_MAP[p]
+            elif len(p) == 1 and 'a' <= p <= 'z':
+                vk = ord(p.upper())
+        return mods, vk
+
+    def _hotkey_loop(self):
+        """后台线程：用 RegisterHotKey 监听全局热键"""
+        # 获取线程 ID 供退出时发 WM_QUIT
+        self._hotkey_thread_id = threading.get_ident()
+        # 必须先调用一次 PeekMessage 创建消息队列
+        msg = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0x0001)  # PM_NOREMOVE
+        mods, vk = self._parse_hotkey(self.config['hotkey'])
+        if not mods or not vk:
+            self.root.after(0, lambda: self.status_var.set("快捷键格式无效: {}".format(self.config['hotkey'])))
             return
+        hkid = 1
+        if not user32.RegisterHotKey(None, hkid, mods | MOD_NOREPEAT, vk):
+            self.root.after(0, lambda: self.status_var.set("快捷键注册失败（被其他程序占用）"))
+            return
+        self.root.after(0, lambda: self.status_var.set("快捷键: {}  ✓".format(self.config['hotkey'].upper())))
         try:
-            if self._hotkey_registered:
-                try:
-                    keyboard.remove_hotkey(self._handler)
-                except Exception:
-                    keyboard.unhook_all_hotkeys()
-            self._handler = keyboard.add_hotkey(self.config['hotkey'], self._toggle, suppress=True)
-            self._hotkey_registered = True
-            self.status_var.set("快捷键: {}  ✓".format(self.config['hotkey'].upper()))
-            # 刷新健康检测的时间基准
-            self._last_toggle_time = time.time()
-        except Exception as e:
-            self.status_var.set("快捷键注册失败: {}".format(e))
-            print(f"[TextQuicker] 注册快捷键失败: {e}")
+            while self._hotkey_active:
+                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if ret == 0:  # WM_QUIT
+                    break
+                if msg.message == WM_HOTKEY and msg.wParam == hkid:
+                    self.root.after(0, self._toggle)
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            user32.UnregisterHotKey(None, hkid)
+            self._hotkey_thread_id = None
+
+    def _register_hotkey(self):
+        """注册全局热键（使用 Windows RegisterHotKey API，不会再被系统卸载）"""
+        # 先停旧线程
+        if self._hotkey_active:
+            self._hotkey_active = False
+            if self._hotkey_thread_id:
+                user32.PostThreadMessageW(self._hotkey_thread_id, WM_QUIT, 0, 0)
+            self._hotkey_thread = None
+            self._hotkey_thread_id = None
+        # 启动新线程
+        self._hotkey_active = True
+        self._hotkey_thread = threading.Thread(target=self._hotkey_loop, daemon=True)
+        self._hotkey_thread.start()
+        self._hotkey_registered = True
 
     def _toggle(self):
-        # 记录触发时间，供健康检测使用
-        self._last_toggle_time = time.time()
         try:
             self.root.after(0, self._do_toggle)
         except tk.TclError as e:
@@ -770,23 +837,6 @@ class TextQuickerApp:
 
     def _minimize_to_tray(self):
         self.root.withdraw()
-
-    # ── 热键健康检测 ──────────────────────────
-    def _start_hotkey_health_check(self):
-        """启动热键健康检测，每 15 秒刷新一次钩子"""
-        self._hotkey_health_timer = self.root.after(15000, self._check_hotkey_health)
-
-    def _check_hotkey_health(self):
-        """检测窗口是否处于隐藏待命状态，如果是则刷新热键钩子"""
-        try:
-            if (HAS_KEYBOARD and self._hotkey_registered
-                    and self.root.state() == 'withdrawn'):
-                print(f"[TextQuicker] 例行热键维护，刷新钩子")
-                self._register_hotkey()
-        except Exception as e:
-            print(f"[TextQuicker] 热键健康检测异常: {e}")
-        finally:
-            self._start_hotkey_health_check()
 
     # ── 设置 ───────────────────────────────────
     def _open_settings(self):
@@ -828,23 +878,20 @@ class TextQuickerApp:
 
     def _quit_app(self, icon=None, item=None):
         self._save_geometry()
-        # 停止热键健康检测
-        if self._hotkey_health_timer:
+        # 停止热键后台线程
+        self._hotkey_active = False
+        if self._hotkey_thread_id:
             try:
-                self.root.after_cancel(self._hotkey_health_timer)
+                user32.PostThreadMessageW(self._hotkey_thread_id, WM_QUIT, 0, 0)
             except Exception:
                 pass
-            self._hotkey_health_timer = None
+            self._hotkey_thread_id = None
+        self._hotkey_thread = None
         try:
             if self.tray:
                 self.tray.stop()
         except Exception as e:
             print(f"[TextQuicker] 停止托盘失败: {e}")
-        if HAS_KEYBOARD and self._hotkey_registered:
-            try:
-                keyboard.unhook_all_hotkeys()
-            except Exception as e:
-                print(f"[TextQuicker] 卸载快捷键失败: {e}")
         self.root.destroy()
 
     def run(self):
