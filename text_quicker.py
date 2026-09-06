@@ -135,29 +135,29 @@ def next_id(snippets):
     return max((s.get('id', 0) for s in snippets), default=0) + 1
 
 # ── 剪贴板 & 粘贴 ─────────────────────────────
-def copy_to_clipboard(text, root=None):
-    """复制文本到剪贴板。优先 pyperclip，fallback 到 tkinter（复用 root 窗口避免泄漏）"""
-    if HAS_PYPERCLIP:
+def copy_to_clipboard(text):
+    """写入剪贴板。
+
+    v1.0.4 修复：只使用 pyperclip，不再 fallback 到 tkinter。
+    原因：tkinter 在 Windows 上是「延迟渲染」——Tk 内部仅 SetClipboardData(NULL) 登记格式，
+    真实数据要等本进程主线程收到 WM_RENDERFORMAT 消息才交付。一旦 TextQuicker 主线程
+    阻塞/窗口异常，剪贴板会停在「有格式无数据」状态，导致全系统复制粘贴失效（锁死）。
+    pyperclip 内部自建隐藏窗口 + 立即渲染 + finally 必释放锁，是安全实现。
+
+    带重试以避开其它程序（如微信）短暂占用剪贴板；全部失败返回 False，由调用方提示用户。
+    """
+    if not HAS_PYPERCLIP:
+        print("[TextQuicker] 缺少 pyperclip，无法安全写入剪贴板（请 pip install pyperclip）")
+        return False
+    last_err = None
+    for _ in range(5):  # 最多约 2.5 秒，避开瞬时占用
         try:
             pyperclip.copy(text)
             return True
         except Exception as e:
-            print(f"[TextQuicker] pyperclip 复制失败: {e}")
-    try:
-        if root is not None:
-            root.clipboard_clear()
-            root.clipboard_append(text)
-            root.update()
-        else:
-            r = tk.Tk()
-            r.withdraw()
-            r.clipboard_clear()
-            r.clipboard_append(text)
-            r.update()
-            r.destroy()
-        return True
-    except Exception as e:
-        print(f"[TextQuicker] tkinter 复制失败: {e}")
+            last_err = e
+            time.sleep(0.5)
+    print(f"[TextQuicker] 剪贴板写入失败（可能正被其它程序占用）: {last_err}")
     return False
 
 def simulate_paste():
@@ -728,6 +728,22 @@ class TextQuickerApp:
             save_snippets(self.snippets)
             self._refresh_list()
 
+    def _focus_prev_window(self):
+        """把前台还给之前的窗口，并确认是否真的抢回焦点。
+
+        Windows 限制后台进程抢前台（目标为管理员权限进程时必然失败），
+        若抢不回来仍发 Ctrl+V 会把按键送给错误窗口，必须检测（v1.0.4）。
+        """
+        if not HAS_WIN32 or not self._prev_hwnd:
+            return False
+        try:
+            win32gui.SetForegroundWindow(self._prev_hwnd)
+            time.sleep(0.15)
+            return win32gui.GetForegroundWindow() == self._prev_hwnd
+        except Exception as e:
+            print(f"[TextQuicker] 恢复前台窗口失败: {e}")
+            return False
+
     def _use_selected(self):
         sel = self.tree.selection()
         if not sel:
@@ -736,17 +752,17 @@ class TextQuickerApp:
         s = next((x for x in self.snippets if str(x['id']) == str(sel[0])), None)
         if not s:
             return
+        # v1.0.4: 先写剪贴板（窗口仍可见，失败可直接提示），成功后再隐藏窗口去自动粘贴
+        if not copy_to_clipboard(s.get('content', '')):
+            self.status_var.set("⚠ 剪贴板正被其它程序占用，复制失败，请稍后重试")
+            return
         self.root.withdraw()
-        if HAS_WIN32:
-            try:
-                win32gui.SetForegroundWindow(self._prev_hwnd)
-            except Exception as e:
-                print(f"[TextQuicker] 恢复前台窗口失败: {e}")
-        time.sleep(0.1)
-        # P1: 复用 root 窗口，避免每次 new Tk()
-        copy_to_clipboard(s.get('content', ''), root=self.root)
         if self.config.get('auto_paste', True):
-            threading.Thread(target=simulate_paste, daemon=True).start()
+            if self._focus_prev_window():
+                threading.Thread(target=simulate_paste, daemon=True).start()
+            else:
+                # 焦点没切回去：绝不盲目发 Ctrl+V（会发给错误窗口），提示用户手动粘贴
+                print("[TextQuicker] 未能切回原窗口焦点，已跳过自动粘贴，请手动 Ctrl+V")
 
     # ── 快捷键（Windows RegisterHotKey API）───
     def _parse_hotkey(self, hotkey_str):
